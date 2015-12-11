@@ -165,13 +165,14 @@
 			endPos = pos[1];
 
 			// Get the last few characters before the one the user just typed,
-			// to provide context for the transliteration regexes.
+			// to provide context for the transliteration regexes. But don't
+			// include anything before an element boundary (denoted by '\uFFFE').
 			// We need to append c because it hasn't been added to $this.val() yet
 			input = this.lastNChars(
-				this.$element.val() || this.$element.text(),
+				this.$element.val() || getTextRepresentation( this.$element[ 0 ] ),
 				startPos,
 				this.inputmethod.maxKeyLength
-			);
+			).replace( /.*\uFFFE/, '' );
 			input += c;
 
 			replacement = this.transliterate( input, this.context, altGr );
@@ -439,6 +440,46 @@
 	}
 
 	/**
+	 * Like textContent except open/close tags become '\uFFFE'.
+	 * This has offsets consistent with getDivCaretPosition/setDivCaretPosition , whilst
+	 * avoiding matches across tag boundaries.
+	 *
+	 * @param {Node} node The node
+	 * @return {String} The node text
+	 */
+	function getTextRepresentation( node ) {
+		var startNode = node,
+			text = [];
+		while ( true ) {
+			while ( node.firstChild ) {
+				node = node.firstChild;
+				if ( node.nodeType !== Node.TEXT_NODE ) {
+					text.push( '\uFFFE' );
+				}
+			}
+			if ( node.nodeType === Node.TEXT_NODE ) {
+				text.push( node.nodeValue );
+			}
+			while ( true ) {
+				if ( node === startNode ) {
+					return text.join( '' );
+				}
+				if ( node.nodeType !== Node.TEXT_NODE ) {
+					text.push( '\uFFFE' );
+				}
+				if ( node.nextSibling ) {
+					break;
+				}
+				node = node.parentNode;
+			}
+			node = node.nextSibling;
+			if ( node.nodeType !== Node.TEXT_NODE ) {
+				text.push( '<' );
+			}
+		}
+	}
+
+	/**
 	 * Returns an array [start, end] of the beginning
 	 * and the end of the current selection in $element
 	 */
@@ -522,6 +563,7 @@
 			newLines,
 			scrollTop,
 			range,
+			range2,
 			correction,
 			textNode,
 			element = $element.get( 0 );
@@ -542,14 +584,13 @@
 
 			textNode = document.createTextNode( replacement );
 			range.deleteContents();
+			start = getCaretPosition( $element )[ 0 ];
 			range.insertNode( textNode );
+			range2 = rangy.createRange();
+			range2.setStart( textNode, textNode.length );
+			range2.setEnd( textNode, textNode.length );
 			range.commonAncestorContainer.normalize();
-			start = end = start + replacement.length - correction[0];
-			setCaretPosition( $element, {
-				start: start,
-				end: end
-			} );
-
+			selection.setSingleRange( range2 );
 			return;
 		}
 
@@ -591,48 +632,90 @@
 		}
 	}
 
+	/**
+	 * Return position numbers for the selection start/end within an element
+	 *
+	 * The values are consistent with offsets in getTextRepresentation output,
+	 * i.e. zero for the first DOM offset inside the element, then incremented by one
+	 * for each text character (unicode code unit) or open/close tag crossed.
+	 *
+	 * @param {HTMLElement} element The element inside which to look
+	 * @return {Number[]} Start and end offsets (either will be zero if not found)
+	 */
 	function getDivCaretPosition( element ) {
-		var charIndex = 0,
-			start = 0,
-			end = 0,
+		var sel, range,
+			offset = 0,
+			start = null,
+			end = null,
 			foundStart = false,
-			foundEnd = false,
-			sel;
+			foundEnd = false;
 
-		rangy.init();
-		sel = rangy.getSelection();
-
-		function traverseTextNodes( node, range ) {
-			var i, childNodesCount;
+		/**
+		 * Walk nodes, incrementing offset, and set start/end offsets when found
+		 *
+		 * @param {Node} node The node to walk
+		 * @param {boolean} [recursing] True if being called from itself recursively
+		 */
+		function traverseNodes( node, recursing ) {
+			var i, len;
 
 			if ( node.nodeType === Node.TEXT_NODE ) {
 				if ( !foundStart && node === range.startContainer ) {
-					start = charIndex + range.startOffset;
+					start = offset + range.startOffset;
 					foundStart = true;
 				}
-
-				if ( foundStart && node === range.endContainer ) {
-					end = charIndex + range.endOffset;
+				if ( foundStart && !foundEnd && node === range.endContainer ) {
+					end = offset + range.endOffset;
 					foundEnd = true;
 				}
-
-				charIndex += node.length;
+				offset += node.length;
 			} else {
-				childNodesCount = node.childNodes.length;
-
-				for ( i = 0; i < childNodesCount; ++i ) {
-					traverseTextNodes( node.childNodes[i], range );
-					if ( foundEnd ) {
+				if ( recursing ) {
+					// Increment offset for node start
+					offset += 1;
+				}
+				for ( i = 0, len = node.childNodes.length; i < len + 1; i++ ) {
+					if (
+						!foundStart &&
+						node === range.startContainer &&
+						i === range.startOffset
+					) {
+						start = offset;
+						foundStart = true;
+					}
+					if (
+						foundStart &&
+						node === range.endContainer &&
+						i === range.endOffset
+					) {
+						end = offset;
+						foundEnd = true;
+					}
+					if ( i === len || foundEnd ) {
 						break;
 					}
+					// recurse, incrementing for node start and end
+					traverseNodes( node.childNodes[ i ], true );
+				}
+				if ( recursing ) {
+					// Increment offset for node end
+					offset += 1;
 				}
 			}
 		}
 
-		if ( sel.rangeCount ) {
-			traverseTextNodes( element, sel.getRangeAt( 0 ) );
+		rangy.init();
+		sel = rangy.getSelection();
+		if ( sel.rangeCount === 0 ) {
+			// TODO: why do we return 0, 0 in this case?
+			return [ 0, 0 ];
 		}
-
+		range = sel.getRangeAt( 0 );
+		traverseNodes( element );
+		if ( start === null || end === null ) {
+			// TODO: why do we return 0, 0 in this case?
+			return [ 0, 0 ];
+		}
 		return [ start, end ];
 	}
 
@@ -672,48 +755,75 @@
 
 	/**
 	 * Set the caret position in the div.
+	 *
 	 * @param {Element} element The content editable div element
-	 * @param position
+	 * @param {Object} position
+	 * @param {number} position.start Start position (consistent with getDivCaretPosition)
+	 * @param {number} position.end End position (consistent with getDivCaretPosition)
 	 */
 	function setDivCaretPosition( element, position ) {
-		var nextCharIndex,
-			charIndex = 0,
+		var offset = 0,
 			range = rangy.createRange(),
 			foundStart = false,
 			foundEnd = false;
 
-		range.collapseToPoint( element, 0 );
-
-		function traverseTextNodes( node ) {
+		/**
+		 * Walk nodes, incrementing offset, and set range start/end when found
+		 *
+		 * @param {Node} node The node to walk
+		 * @param {boolean} [recursing] True if being called from itself recursively
+		 */
+		function traverseNodes( node, recursing ) {
 			var i, len;
 
-			if ( node.nodeType === 3 ) {
-				nextCharIndex = charIndex + node.length;
-
-				if ( !foundStart && position.start >= charIndex && position.start <= nextCharIndex ) {
-					range.setStart( node, position.start - charIndex );
+			if ( node.nodeType === Node.TEXT_NODE ) {
+				if (
+					!foundStart &&
+					offset <= position.start &&
+					position.start <= offset + node.length
+				) {
+					range.setStart( node, position.start - offset );
 					foundStart = true;
 				}
-
-				if ( foundStart && position.end >= charIndex && position.end <= nextCharIndex ) {
-					range.setEnd( node, position.end - charIndex );
+				if (
+					foundStart &&
+					offset <= position.end &&
+					position.end <= offset + node.length
+				) {
+					range.setEnd( node, position.end - offset );
+					rangy.getSelection().setSingleRange( range );
 					foundEnd = true;
 				}
-
-				charIndex = nextCharIndex;
+				offset += node.length;
 			} else {
-				for ( i = 0, len = node.childNodes.length; i < len; ++i ) {
-					traverseTextNodes( node.childNodes[i] );
-					if ( foundEnd ) {
+				if ( recursing ) {
+					// Increment offset for node start
+					offset += 1;
+				}
+				for ( i = 0, len = node.childNodes.length; i < len; i++ ) {
+					if ( !foundStart && position.start === offset ) {
+						range.setStart( node, i );
+						foundStart = true;
+					}
+					if ( foundStart && position.end === offset ) {
+						range.setEnd( node, i );
 						rangy.getSelection().setSingleRange( range );
+						foundEnd = true;
+					}
+					if ( i === len || foundEnd ) {
 						break;
 					}
+					traverseNodes( node.childNodes[ i ], true );
+				}
+				if ( recursing ) {
+					// Increment offset for node end
+					offset += 1;
 				}
 			}
 		}
 
-		traverseTextNodes( element );
-
+		range.collapseToPoint( element, 0 );
+		traverseNodes( element );
 	}
 
 	/**
